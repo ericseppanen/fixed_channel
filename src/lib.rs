@@ -46,39 +46,39 @@
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-struct GenPointerStore<T> {
+struct AtomicSeqPointer<T> {
     inner: AtomicUsize,
     phantom: PhantomData<T>,
 }
 
 // impl by hand so we don't get a trait bound `where T: Default`.
-impl<T> Default for GenPointerStore<T> {
+impl<T> Default for AtomicSeqPointer<T> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T> GenPointerStore<T> {
+impl<T> AtomicSeqPointer<T> {
     const fn new() -> Self {
-        let val = GenPointer::<T>::new();
+        let val = SeqPointer::<T>::new();
         Self {
             inner: AtomicUsize::new(val.into_raw()),
             phantom: PhantomData,
         }
     }
 
-    fn read(&self) -> GenPointer<T> {
+    fn read(&self) -> SeqPointer<T> {
         let val = self.inner.load(Ordering::Acquire);
-        GenPointer::from_raw(val)
+        SeqPointer::from_raw(val)
     }
 
-    fn _write(&self, val: GenPointer<T>) {
+    fn _write(&self, val: SeqPointer<T>) {
         let val = val.into_raw();
         self.inner.store(val, Ordering::Release);
     }
 
     /// Returns true if the update succeeded.
-    fn try_update(&self, old: GenPointer<T>, new: GenPointer<T>) -> bool {
+    fn try_update(&self, old: SeqPointer<T>, new: SeqPointer<T>) -> bool {
         let old = old.into_raw();
         let new = new.into_raw();
         self.inner
@@ -87,35 +87,34 @@ impl<T> GenPointerStore<T> {
     }
 }
 
-/// A `GenerationPointer` holds either a pointer or a generation count.
+/// A `SeqPointer` holds either a pointer or a sequence number.
 ///
 /// There are two variants possible:
 /// - Pointer: stored exactly like a regular pointer.
-/// - Generation Count: least-significant bit is 1. Other bits contain the count.
+/// - Sequence Number: least-significant bit is 1. Other bits contain the count.
 ///
-// FIXME: "Gen count" and "sequence" are synonyms. Pick one.
-struct GenPointer<T> {
+struct SeqPointer<T> {
     inner: usize,
     phantom: PhantomData<T>,
 }
 
-impl<T> std::fmt::Debug for GenPointer<T> {
+impl<T> std::fmt::Debug for SeqPointer<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("GenPointer").field(&self.inner).finish()
+        f.debug_tuple("SeqPointer").field(&self.inner).finish()
     }
 }
 
 // impl by hand so we don't get a trait bound `where T: Default`.
-impl<T> Default for GenPointer<T> {
+impl<T> Default for SeqPointer<T> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T> GenPointer<T> {
+impl<T> SeqPointer<T> {
     const fn new() -> Self {
         Self {
-            // 1 is the tag for a gencount.
+            // 1 is the tag for a sequence number.
             inner: 1,
             phantom: PhantomData,
         }
@@ -135,7 +134,7 @@ impl<T> GenPointer<T> {
         }
     }
 
-    fn from_gencount(count: usize) -> Self {
+    fn from_seq(count: usize) -> Self {
         // FIXME: detect overflow during shift?
         let count = count << 1 | 1;
         Self {
@@ -148,7 +147,7 @@ impl<T> GenPointer<T> {
         self.inner & 0x1 == 0
     }
 
-    fn is_gencount(&self) -> bool {
+    fn is_seq(&self) -> bool {
         self.inner & 0x1 != 0
     }
 
@@ -210,7 +209,7 @@ impl<const N: usize> AtomicSeqIndex<N> {
 }
 
 pub struct FixedChannel<T, const N: usize> {
-    pointer_array: [GenPointerStore<T>; N],
+    pointer_array: [AtomicSeqPointer<T>; N],
     phantom: PhantomData<T>,
     head: AtomicSeqIndex<N>,
     tail: AtomicSeqIndex<N>,
@@ -225,7 +224,7 @@ impl<T, const N: usize> Default for FixedChannel<T, N> {
 impl<T, const N: usize> FixedChannel<T, N> {
     // FIXME: make this const
     pub fn new() -> Self {
-        let pointer_array = core::array::from_fn(|_| GenPointerStore::new());
+        let pointer_array = core::array::from_fn(|_| AtomicSeqPointer::new());
         Self {
             pointer_array,
             phantom: PhantomData,
@@ -251,8 +250,8 @@ impl<T, const N: usize> FixedChannel<T, N> {
         loop {
             let head_info = self.head.read();
             let (seq, index) = head_info.split();
-            let old = GenPointer::from_gencount(seq);
-            let new = GenPointer::from_pointer(raw);
+            let old = SeqPointer::from_seq(seq);
+            let new = SeqPointer::from_pointer(raw);
             if self.pointer_array[index].try_update(old, new) {
                 // success!
                 let up = self.head.try_update(head_info, head_info.increment());
@@ -286,7 +285,7 @@ impl<T, const N: usize> FixedChannel<T, N> {
                     // A value is present at this location; we can move forward.
                     break val_maybe;
                 }
-                if val_maybe.is_gencount() {
+                if val_maybe.is_seq() {
                     // There is no value at the tail. Need to re-read the tail info.
                     let prev_tail = tail;
                     tail = self.tail.read();
