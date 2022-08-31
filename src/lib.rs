@@ -40,14 +40,13 @@
 //!
 //! TODO:
 //! - For items that are smaller than a pointer, allow by-value storage.
-//! - Instead of casting to usize, cast the seq to pointers using sptr::invalid
 //!
 
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 struct AtomicSeqPointer<T> {
-    inner: AtomicUsize,
+    inner: AtomicPtr<T>,
     phantom: PhantomData<T>,
 }
 
@@ -62,7 +61,7 @@ impl<T> AtomicSeqPointer<T> {
     const fn new() -> Self {
         let val = SeqPointer::<T>::new();
         Self {
-            inner: AtomicUsize::new(val.into_raw()),
+            inner: AtomicPtr::new(val.into_raw()),
             phantom: PhantomData,
         }
     }
@@ -100,7 +99,7 @@ impl<T> AtomicSeqPointer<T> {
 /// - Sequence Number: least-significant bit is 1. Other bits contain the count.
 ///
 struct SeqPointer<T> {
-    inner: usize,
+    inner: *mut T,
     phantom: PhantomData<T>,
 }
 
@@ -121,12 +120,12 @@ impl<T> SeqPointer<T> {
     const fn new() -> Self {
         Self {
             // 1 is the tag for a sequence number.
-            inner: 1,
+            inner: sptr::invalid_mut(1),
             phantom: PhantomData,
         }
     }
 
-    fn from_raw(raw: usize) -> Self {
+    fn from_raw(raw: *mut T) -> Self {
         Self {
             inner: raw,
             phantom: PhantomData,
@@ -135,7 +134,7 @@ impl<T> SeqPointer<T> {
 
     fn from_pointer(pointer: *mut T) -> Self {
         Self {
-            inner: pointer as usize,
+            inner: pointer,
             phantom: PhantomData,
         }
     }
@@ -144,20 +143,24 @@ impl<T> SeqPointer<T> {
         // FIXME: detect overflow during shift?
         let count = count << 1 | 1;
         Self {
-            inner: count,
+            inner: sptr::invalid_mut(count),
             phantom: PhantomData,
         }
     }
 
     fn is_pointer(&self) -> bool {
-        self.inner & 0x1 == 0
+        #![allow(unstable_name_collisions)]
+        use sptr::Strict;
+        self.inner.addr() & 0x1 == 0
     }
 
     fn _is_seq(&self) -> bool {
-        self.inner & 0x1 != 0
+        #![allow(unstable_name_collisions)]
+        use sptr::Strict;
+        self.inner.addr() & 0x1 != 0
     }
 
-    const fn into_raw(self) -> usize {
+    const fn into_raw(self) -> *mut T {
         self.inner
     }
 
