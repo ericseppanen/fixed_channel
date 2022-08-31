@@ -31,17 +31,20 @@
 //!   each time a send succeeds?
 //!
 //! - A receive goes like this:
-//!   1. Read the tail_data (tail index and sequence number).
-//!   2. Atomically read the tail.
-//!   3. If the value is empty, re-read the tail_data. If it hasn't changed, we
-//!      must sleep (recv) or return None (try_recv).
-//!   4. Try to increment the tail data (atomic swap from N to N+1)
-//!   4.a. if that swap fails, someone else read this value; go back to 1.
-//!        (optional#2: or maybe try the next location?)
-//!   4.b. if that swap succeeds, the data is ours. Exit successfully.
+//!   1. Read the head.
+//!   2. Read the tail.
+//!   3. If the head and the tail are the same, the queue is empty.
+//!      (Note wraparound to full looks different: head will be at seq N+1.)
+//!   4. We know that there were some values in the queue, so it's safe to move the tail.
+//!   5. Atomically increment the tail. If that fails, go back to 1.
+//!   6. We now "own" that slot; swap a new sequence number into that slot,
+//!      and receive back its contents (which must be a pointer).
+//!      If we got a seq rather than a pointer, that's a bug.
 //!
 //! TODO:
 //! - For items that are smaller than a pointer, allow by-value storage.
+//! - Instead of casting to usize, cast the seq to pointers using sptr::invalid
+//!
 
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -84,6 +87,12 @@ impl<T> AtomicSeqPointer<T> {
         self.inner
             .compare_exchange(old, new, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
+    }
+
+    fn swap(&self, new: SeqPointer<T>) -> SeqPointer<T> {
+        let new = new.into_raw();
+        let old = self.inner.swap(new, Ordering::AcqRel);
+        SeqPointer::from_raw(old)
     }
 }
 
@@ -147,7 +156,7 @@ impl<T> SeqPointer<T> {
         self.inner & 0x1 == 0
     }
 
-    fn is_seq(&self) -> bool {
+    fn _is_seq(&self) -> bool {
         self.inner & 0x1 != 0
     }
 
@@ -177,7 +186,7 @@ impl<const N: usize> SeqIndex<N> {
     }
 
     fn increment(&self) -> Self {
-        Self(self.0 + 1)
+        Self(self.0.wrapping_add(1))
     }
 }
 
@@ -208,8 +217,12 @@ impl<const N: usize> AtomicSeqIndex<N> {
     }
 }
 
+/// A `push` failed because the channel is full.
+#[derive(Debug)]
+pub struct Full<T>(pub T);
+
 pub struct FixedChannel<T, const N: usize> {
-    pointer_array: [AtomicSeqPointer<T>; N],
+    pointer_array: Box<[AtomicSeqPointer<T>]>,
     phantom: PhantomData<T>,
     head: AtomicSeqIndex<N>,
     tail: AtomicSeqIndex<N>,
@@ -221,107 +234,162 @@ impl<T, const N: usize> Default for FixedChannel<T, N> {
     }
 }
 
+impl<T, const N: usize> Drop for FixedChannel<T, N> {
+    fn drop(&mut self) {
+        for slot in &*self.pointer_array {
+            let val_maybe = slot.read();
+            if val_maybe.is_pointer() {
+                let raw = val_maybe.into_pointer();
+                // SAFETY: todo
+                unsafe {
+                    let _ = Box::from_raw(raw);
+                }
+            }
+        }
+    }
+}
+
 impl<T, const N: usize> FixedChannel<T, N> {
     // FIXME: make this const
     pub fn new() -> Self {
-        let pointer_array = core::array::from_fn(|_| AtomicSeqPointer::new());
+        let mut elements = Vec::new();
+        elements.resize_with(N, || AtomicSeqPointer::<T>::new());
         Self {
-            pointer_array,
+            pointer_array: elements.into_boxed_slice(),
             phantom: PhantomData,
             head: AtomicSeqIndex::new(),
             tail: AtomicSeqIndex::new(),
         }
     }
 
-    // - A send goes like this:
-    //   1. Read the head_data (head index and sequence number).
-    //   2. Try to atomically swap our T pointer into that head location
-    //      (from seq-null to t)
-    //   2.a. if that swap fails, go back to 1
-    //        (optional#1: or maybe try the next location?)
-    //   2.b. if the swap succeeds, we have successfully pushed. Keep going.
-    //   3. Try to atomically swap an updated head_data.
-    //   3.a. if that swap fails, optional#1 must be in play? A sender that
-    //        came after us wrote the head before us. Their write supercedes
-    //        ours, so we can exit sucessfully.
-    //   3.b. if that swap succeeds, we can exit successfully.
-    pub fn push(&self, val: Box<T>) {
+    /// Try to push a value into the queue.
+    pub fn push(&self, val: Box<T>) -> Result<(), Full<Box<T>>> {
         let raw = Box::leak(val);
+        let mut prev_head = None;
         loop {
-            let head_info = self.head.read();
-            let (seq, index) = head_info.split();
+            let head = self.head.read();
+            if let Some(prev) = prev_head {
+                if prev == head {
+                    // Failed to push, and not racing with anyone else.
+                    // Must be full.
+                    // SAFETY: todo
+                    let reboxed = unsafe { Box::from_raw(raw) };
+                    return Err(Full(reboxed));
+                }
+            }
+            let (seq, index) = head.split();
             let old = SeqPointer::from_seq(seq);
             let new = SeqPointer::from_pointer(raw);
             if self.pointer_array[index].try_update(old, new) {
                 // success!
-                let up = self.head.try_update(head_info, head_info.increment());
+                let up = self.head.try_update(head, head.increment());
                 // We're not doing the optional#1 trick yet, so this always works.
                 assert!(up);
-                return;
+                return Ok(());
             }
             // We failed to update the head.
             // Go back and start over.
+            prev_head = Some(head);
         }
     }
 
-    // - A receive goes like this:
-    //   1. Read the tail_data (tail index and sequence number).
-    //   2. Atomically read the tail.
-    //   3. If the value is empty, re-read the tail_data. If it hasn't changed, we
-    //      must sleep (recv) or return None (try_recv).
-    //   4. Try to increment the tail data (atomic swap from N to N+1)
-    //   4.a. if that swap fails, someone else read this value; go back to 1.
-    //        (optional#2: or maybe try the next location?)
-    //   4.b. if that swap succeeds, the data is ours. Exit successfully.
-    //
+    /// Attempt to pop a new value from the queue.
     pub fn pop(&self) -> Option<Box<T>> {
         loop {
-            // Read the tail data.
-            let mut tail = self.tail.read();
-            let val_maybe = loop {
-                let (_, index) = tail.split();
-                let val_maybe = self.pointer_array[index].read();
-                if val_maybe.is_pointer() {
-                    // A value is present at this location; we can move forward.
-                    break val_maybe;
-                }
-                if val_maybe.is_seq() {
-                    // There is no value at the tail. Need to re-read the tail info.
-                    let prev_tail = tail;
-                    tail = self.tail.read();
-                    if tail == prev_tail {
-                        // No change; the queue is empty.
-                        return None;
-                    }
-                }
-                // Someone else changed the tail, so we need to start again.
-            };
+            // FIXME: does the order of these two matter?
+            let head = self.head.read();
+            let tail = self.tail.read();
+            if head == tail {
+                // Queue is empty
+                return None;
+            }
+            // We know that there were a nonzero number of items in the queue,
+            // at the moment we read the tail. Therefore it's safe to attempt
+            // to move the tail.
             let new_tail = tail.increment();
             if self.tail.try_update(tail, new_tail) {
-                let raw = val_maybe.into_pointer();
+                // We successfully moved the tail, so whatever value is at the
+                // old tail index is ours exclusively.
+                let (seq, index) = tail.split();
+                let new_seq = SeqPointer::from_seq(seq + 1);
+                let val = self.pointer_array[index].swap(new_seq);
+                // It shouldn't be possible to hit a sequence number here,
+                // since we are the exclusive owner of this slot.
+                let raw = val.into_pointer();
 
                 // SAFETY: todo
                 let boxed_val = unsafe { Box::from_raw(raw) };
                 return Some(boxed_val);
             }
-            // If the update failed, someone else grabbed this
-            // value. We need to start over.
         }
+        // We failed to move the tail, so we're racing with someone and must
+        // start over.
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
 
     #[test]
     fn basic_test() {
         let channel = FixedChannel::<u32, 128>::new();
-        channel.push(Box::new(42));
-        channel.push(Box::new(43));
+        channel.push(Box::new(42)).unwrap();
+        channel.push(Box::new(43)).unwrap();
 
-        assert_eq!(channel.pop().as_deref(), Some(&42));
-        assert_eq!(channel.pop().as_deref(), Some(&43));
+        assert_eq!(*channel.pop().unwrap(), 42);
+        assert_eq!(*channel.pop().unwrap(), 43);
         assert_eq!(channel.pop(), None);
+    }
+
+    #[test]
+    fn fill_then_empty() {
+        let channel = FixedChannel::<u32, 4>::new();
+
+        for ii in 0u32..4 {
+            // First loop will write 1,2,3. Second loop 11, 12, 13...
+            let ii = ii * 10;
+            channel.push(Box::new(ii + 1)).unwrap();
+            channel.push(Box::new(ii + 2)).unwrap();
+            channel.push(Box::new(ii + 3)).unwrap();
+            channel.push(Box::new(ii + 4)).unwrap();
+            channel.push(Box::new(ii + 5)).unwrap_err();
+            assert_eq!(*channel.pop().unwrap(), ii + 1);
+            assert_eq!(*channel.pop().unwrap(), ii + 2);
+            assert_eq!(*channel.pop().unwrap(), ii + 3);
+            assert_eq!(*channel.pop().unwrap(), ii + 4);
+            assert_eq!(channel.pop(), None);
+        }
+    }
+
+    #[test]
+    fn racing_readers() {
+        #[cfg(miri)]
+        const SIZE: usize = 1024;
+        #[cfg(not(miri))]
+        const SIZE: usize = 128 * 1024;
+        let channel: Arc<FixedChannel<u32, SIZE>> = Arc::default();
+        for ii in 0u32..(SIZE as u32) {
+            channel.push(Box::new(ii)).unwrap();
+        }
+        let mut threads: Vec<_> = (0..16)
+            .map(|_| {
+                let channel = Arc::clone(&channel);
+                std::thread::spawn(move || {
+                    let mut sum = 0u64;
+                    while let Some(n) = channel.pop() {
+                        sum += *n as u64;
+                    }
+                    sum
+                })
+            })
+            .collect();
+
+        let sum: u64 = threads.drain(..).map(|t| t.join().unwrap()).sum();
+
+        let expected_sum = SIZE * (SIZE - 1) / 2;
+        assert_eq!(sum, expected_sum as u64);
     }
 }
