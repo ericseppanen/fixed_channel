@@ -1,6 +1,6 @@
 //! Principle of operation:
 //!
-//! The channel is implemented as a fixed-size array of atomic "pointers".
+//! The queue is implemented as a fixed-size array of atomic "pointers".
 //! The pointers are special in that they may store several types of data:
 //! - A pointer to a T
 //! - Special values that mean "this slot is empty"
@@ -217,24 +217,24 @@ impl<const N: usize> AtomicSeqIndex<N> {
     }
 }
 
-/// A `push` failed because the channel is full.
+/// A `push` failed because the queue is full.
 #[derive(Debug)]
-pub struct Full<T>(pub T);
+pub struct QueueFull<T>(pub T);
 
-pub struct FixedChannel<T, const N: usize> {
+pub struct FixedQueue<T, const N: usize> {
     pointer_array: Box<[AtomicSeqPointer<T>]>,
     phantom: PhantomData<T>,
     head: AtomicSeqIndex<N>,
     tail: AtomicSeqIndex<N>,
 }
 
-impl<T, const N: usize> Default for FixedChannel<T, N> {
+impl<T, const N: usize> Default for FixedQueue<T, N> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T, const N: usize> Drop for FixedChannel<T, N> {
+impl<T, const N: usize> Drop for FixedQueue<T, N> {
     fn drop(&mut self) {
         for slot in &*self.pointer_array {
             let val_maybe = slot.read();
@@ -249,7 +249,7 @@ impl<T, const N: usize> Drop for FixedChannel<T, N> {
     }
 }
 
-impl<T, const N: usize> FixedChannel<T, N> {
+impl<T, const N: usize> FixedQueue<T, N> {
     // FIXME: make this const
     pub fn new() -> Self {
         let mut elements = Vec::new();
@@ -263,7 +263,7 @@ impl<T, const N: usize> FixedChannel<T, N> {
     }
 
     /// Try to push a value into the queue.
-    pub fn push(&self, val: Box<T>) -> Result<(), Full<Box<T>>> {
+    pub fn push(&self, val: Box<T>) -> Result<(), QueueFull<Box<T>>> {
         let raw = Box::leak(val);
         let mut prev_head = None;
         loop {
@@ -274,7 +274,7 @@ impl<T, const N: usize> FixedChannel<T, N> {
                     // Must be full.
                     // SAFETY: todo
                     let reboxed = unsafe { Box::from_raw(raw) };
-                    return Err(Full(reboxed));
+                    return Err(QueueFull(reboxed));
                 }
             }
             let (seq, index) = head.split();
@@ -335,32 +335,32 @@ mod tests {
 
     #[test]
     fn basic_test() {
-        let channel = FixedChannel::<u32, 128>::new();
-        channel.push(Box::new(42)).unwrap();
-        channel.push(Box::new(43)).unwrap();
+        let queue = FixedQueue::<u32, 128>::new();
+        queue.push(Box::new(42)).unwrap();
+        queue.push(Box::new(43)).unwrap();
 
-        assert_eq!(*channel.pop().unwrap(), 42);
-        assert_eq!(*channel.pop().unwrap(), 43);
-        assert_eq!(channel.pop(), None);
+        assert_eq!(*queue.pop().unwrap(), 42);
+        assert_eq!(*queue.pop().unwrap(), 43);
+        assert_eq!(queue.pop(), None);
     }
 
     #[test]
     fn fill_then_empty() {
-        let channel = FixedChannel::<u32, 4>::new();
+        let queue = FixedQueue::<u32, 4>::new();
 
         for ii in 0u32..4 {
             // First loop will write 1,2,3. Second loop 11, 12, 13...
             let ii = ii * 10;
-            channel.push(Box::new(ii + 1)).unwrap();
-            channel.push(Box::new(ii + 2)).unwrap();
-            channel.push(Box::new(ii + 3)).unwrap();
-            channel.push(Box::new(ii + 4)).unwrap();
-            channel.push(Box::new(ii + 5)).unwrap_err();
-            assert_eq!(*channel.pop().unwrap(), ii + 1);
-            assert_eq!(*channel.pop().unwrap(), ii + 2);
-            assert_eq!(*channel.pop().unwrap(), ii + 3);
-            assert_eq!(*channel.pop().unwrap(), ii + 4);
-            assert_eq!(channel.pop(), None);
+            queue.push(Box::new(ii + 1)).unwrap();
+            queue.push(Box::new(ii + 2)).unwrap();
+            queue.push(Box::new(ii + 3)).unwrap();
+            queue.push(Box::new(ii + 4)).unwrap();
+            queue.push(Box::new(ii + 5)).unwrap_err();
+            assert_eq!(*queue.pop().unwrap(), ii + 1);
+            assert_eq!(*queue.pop().unwrap(), ii + 2);
+            assert_eq!(*queue.pop().unwrap(), ii + 3);
+            assert_eq!(*queue.pop().unwrap(), ii + 4);
+            assert_eq!(queue.pop(), None);
         }
     }
 
@@ -370,16 +370,16 @@ mod tests {
         const SIZE: usize = 1024;
         #[cfg(not(miri))]
         const SIZE: usize = 128 * 1024;
-        let channel: Arc<FixedChannel<u32, SIZE>> = Arc::default();
+        let queue: Arc<FixedQueue<u32, SIZE>> = Arc::default();
         for ii in 0u32..(SIZE as u32) {
-            channel.push(Box::new(ii)).unwrap();
+            queue.push(Box::new(ii)).unwrap();
         }
         let mut threads: Vec<_> = (0..16)
             .map(|_| {
-                let channel = Arc::clone(&channel);
+                let queue = Arc::clone(&queue);
                 std::thread::spawn(move || {
                     let mut sum = 0u64;
-                    while let Some(n) = channel.pop() {
+                    while let Some(n) = queue.pop() {
                         sum += *n as u64;
                     }
                     sum
