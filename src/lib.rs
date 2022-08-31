@@ -1,36 +1,33 @@
 //! Principle of operation:
 //!
-//! The queue is implemented as a fixed-size array of atomic "pointers".
-//! The pointers are special in that they may store several types of data:
-//! - A pointer to a T
-//! - Special values that mean "this slot is empty"
+//! The queue is implemented as a fixed-size array of atomic `SeqPointer` types.
 //!
-//! - A send is accomplished by writing a new T pointer to the tail of the
-//!   queue, then incrementing the tail index.
-//! - A receive is accomplished by atomically swapping an "empty" token into
-//!   the head of the queue, and receiving the T pointer that was there.
+//! A `SeqPointer` can contain either a pointer or a sequence number. A sequence
+//! number means that slot in the array is empty.
 //!
-//! - A send goes like this:
+//! Pushing to the queue is accomplished by writing a new T pointer to the head
+//! of the queue, then incrementing the tail index.
+//!
+//! Popping a value from the queue is accomplished by atomically swapping an
+//! "empty" `SeqPointer` with the tail of the queue, receiving in exchange
+//! the pointer that was there.
+//!
+//! How a send works, in more detail:
+//!
 //!   1. Read the head_data (head index and sequence number).
 //!   2. Try to atomically swap our T pointer into that head location
-//!      (from seq-null to t)
-//!   2.a. if that swap fails, go back to 1
-//!        (optional#1: or maybe try the next location?)
-//!   2.b. if the swap succeeds, we have successfully pushed. Keep going.
+//!      (from empty to pointer)
+//!      a. if that swap fails, go back to 1
+//!         (optional#1: or maybe try the next location?)
+//!      b. if the swap succeeds, we have successfully pushed. Keep going.
 //!   3. Try to atomically swap an updated head_data.
-//!   3.a. if that swap fails, optional#1 must be in play? A sender that
-//!        came after us wrote the head before us. Their write supercedes
-//!        ours, so we can exit sucessfully.
-//!   3.b. if that swap succeeds, we can exit successfully.
+//!      a. if that swap fails, optional#1 must be in play? A sender that
+//!         came after us wrote the head before us. Their write supercedes
+//!         ours, so we can exit sucessfully.
+//!      b. if that swap succeeds, we can exit successfully.
 //!
-//!   How does a sender know to not spin forever when the head catches the tail?
-//!   If step 2 fails but step 1 reads the same head_data, then a try_send would
-//!   fail.
+//! How a receive works, in more detail:
 //!
-//!   How does a sender wake a sleeping receiver? Should we wake additional receivers
-//!   each time a send succeeds?
-//!
-//! - A receive goes like this:
 //!   1. Read the head.
 //!   2. Read the tail.
 //!   3. If the head and the tail are the same, the queue is empty.
