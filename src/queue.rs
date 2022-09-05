@@ -1,3 +1,5 @@
+//! A lock-free, fixed size queue.
+//!
 //! Principle of operation:
 //!
 //! The queue is implemented as a fixed-size array of atomic `SeqPointer` types.
@@ -5,28 +7,34 @@
 //! A `SeqPointer` can contain either a pointer or a sequence number. A sequence
 //! number means that slot in the array is empty.
 //!
-//! Pushing to the queue is accomplished by writing a new T pointer to the head
-//! of the queue, then incrementing the tail index.
+//! Pushing to the queue is accomplished by atomically writing a new T pointer
+//! to the head of the queue, then incrementing the head index.
 //!
-//! Popping a value from the queue is accomplished by atomically swapping an
-//! "empty" `SeqPointer` with the tail of the queue, receiving in exchange
-//! the pointer that was there.
+//! Popping a value from the queue is accomplished by incrementing the tail
+//! index, and then atomically exchanging a placeholder value for the pointer
+//! that was stored at that index.
 //!
-//! How a send works, in more detail:
+//! How a push works, in more detail:
 //!
-//!   1. Read the head_data (head index and sequence number).
-//!   2. Try to atomically swap our T pointer into that head location
-//!      (from empty to pointer)
-//!      a. if that swap fails, go back to 1
-//!         (optional#1: or maybe try the next location?)
-//!      b. if the swap succeeds, we have successfully pushed. Keep going.
-//!   3. Try to atomically swap an updated head_data.
-//!      a. if that swap fails, optional#1 must be in play? A sender that
-//!         came after us wrote the head before us. Their write supercedes
-//!         ours, so we can exit sucessfully.
-//!      b. if that swap succeeds, we can exit successfully.
+//!   1. Read the head.
+//!   2. Read the tail.
+//!   3. If we're not on our first iteration, check whether the head is
+//!      unchanged since the previous iteration. If so, check if the tail
+//!      is exactly one sequence number behind the head.
+//!      a. If it is, the queue is full, and we return an Error.
+//!      b. Otherwise, another thread wrote a pointer to the array, but
+//!         stalled before incrementing the head. Since all head increments
+//!         are equivalent, we will try to increment the head. If that swap
+//!         succeeds, keep going. Otherwise start over.
+//!   4. Try to atomically swap our T pointer into the head location of the
+//!      array (from sequence-number to pointer). If that swap fails, start
+//!      over.
+//!   5. Try to atomically swap an updated head. If that swap fails,
+//!      another sender incremented the head before us. Their write
+//!      accomplishes the same thing as ours, so either way we can exit
+//!      sucessfully.
 //!
-//! How a receive works, in more detail:
+//! How a pop works, in more detail:
 //!
 //!   1. Read the head.
 //!   2. Read the tail.
@@ -35,7 +43,7 @@
 //!   4. We know that there were some values in the queue, so it's safe to move the tail.
 //!   5. Atomically increment the tail. If that fails, go back to 1.
 //!   6. We now "own" that slot; swap a new sequence number into that slot,
-//!      and receive back its contents (which must be a pointer).
+//!      and receive its contents (which must be a pointer).
 //!      If we got a seq rather than a pointer, that's a bug.
 //!
 //! TODO:
@@ -77,6 +85,7 @@ impl<T> AtomicSeqPointer<T> {
     }
 
     /// Returns true if the update succeeded.
+    ///
     fn try_update(&self, old: SeqPointer<T>, new: SeqPointer<T>) -> bool {
         let old = old.into_raw();
         let new = new.into_raw();
@@ -188,6 +197,10 @@ impl<const N: usize> SeqIndex<N> {
     fn increment(&self) -> Self {
         Self(self.0.wrapping_add(1))
     }
+
+    fn increment_seq(&self) -> Self {
+        Self(self.0.wrapping_add(N))
+    }
 }
 
 #[derive(Default)]
@@ -207,7 +220,7 @@ impl<const N: usize> AtomicSeqIndex<N> {
         SeqIndex(val)
     }
 
-    // Returns true if the update was successful.
+    /// Returns true if the update was successful.
     fn try_update(&self, old: SeqIndex<N>, new: SeqIndex<N>) -> bool {
         let old = old.0;
         let new = new.0;
@@ -224,20 +237,21 @@ pub struct QueueFull<T>(pub T);
 /// A lock-free concurrent queue with fixed size
 ///
 /// # Examples
-/// ```no_run
-/// use std::sync::Arc;
+/// ```
+/// # use std::sync::Arc;
+/// use std::thread;
+/// # use std::time::Duration;
 /// use fixed_channel::queue::FixedQueue;
 ///
-/// const SIZE: usize = 1024;
-/// let queue: Arc<FixedQueue<u32, SIZE>> = Arc::default();
+/// let queue: Arc<FixedQueue<u32, 128>> = Arc::default();
 ///
 /// let mut threads: Vec<_> = (0..16)
 /// .map(|ii| {
 ///     let queue = Arc::clone(&queue);
-///     std::thread::spawn(move || {
+///     thread::spawn(move || {
 ///         // Push one number, then pop one and return it.
 ///         queue.push(Box::new(ii)).expect("push failed");
-///         std::thread::sleep(std::time::Duration::from_millis(10));
+///         thread::yield_now();
 ///         *queue.pop().expect("pop failed")
 ///     })
 /// })
@@ -294,14 +308,48 @@ impl<T, const N: usize> FixedQueue<T, N> {
         let raw = Box::leak(val);
         let mut prev_head = None;
         loop {
-            let head = self.head.read();
+            // Must read first the head, then the tail. If that's reversed, then
+            // we could incorrectly get an old tail and a new head, and if
+            // they're exactly the right distance apart in time, we may falsely
+            // report that the queue is full. If we get an old head and a new
+            // tail, we won't conclude anything incorrect and will try again.
+            //
+            let mut head = self.head.read();
+            let tail = self.tail.read();
             if let Some(prev) = prev_head {
                 if prev == head {
-                    // Failed to push, and not racing with anyone else.
-                    // Must be full.
-                    // SAFETY: todo
-                    let reboxed = unsafe { Box::from_raw(raw) };
-                    return Err(QueueFull(reboxed));
+                    // We previously attempted to write to this exact head slot and
+                    // failed, which means one of two things happened:
+                    // 1. The queue is full.
+                    // 2. Another thread stalled after writing the pointer but before
+                    //    updating the head.
+                    //
+                    // Try to detect whether the queue is full. Both the head and tail
+                    // might be in motion, so comparing them is somewhat fraught. But
+                    // eventually we will either detect a full queue, or we will make
+                    // forward progress.
+                    if tail.increment_seq() == head {
+                        // The queue is full.
+                        //
+                        // SAFETY: this function has exclusive ownership of the `raw` pointer,
+                        // which we leaked ourselves at the top of this function and have
+                        // failed to write into the queue. Therefore reconstituting the Box
+                        // is always sound.
+                        let reboxed = unsafe { Box::from_raw(raw) };
+                        return Err(QueueFull(reboxed));
+                    }
+
+                    // Attempt to increment the head on behalf of the thread that is stalled.
+                    let new_head = head.increment();
+                    if self.head.try_update(head, new_head) {
+                        // We updated the head, so perhaps we can make progress now.
+                        head = new_head;
+                    } else {
+                        // We failed to update the head, so we are racing with other
+                        // threads (that are making progress), so we need to retry.
+                        prev_head = Some(head);
+                        continue;
+                    }
                 }
             }
             let (seq, index) = head.split();
@@ -309,9 +357,7 @@ impl<T, const N: usize> FixedQueue<T, N> {
             let new = SeqPointer::from_pointer(raw);
             if self.pointer_array[index].try_update(old, new) {
                 // success!
-                let up = self.head.try_update(head, head.increment());
-                // We're not doing the optional#1 trick yet, so this always works.
-                assert!(up);
+                self.head.try_update(head, head.increment());
                 return Ok(());
             }
             // We failed to update the head.
@@ -420,14 +466,13 @@ mod tests {
         assert_eq!(sum, expected_sum as u64);
     }
 
-    #[ignore = "broken"]
     #[test]
     fn push_pop() {
         use std::sync::Arc;
         use FixedQueue;
 
         const SIZE: usize = 1024;
-        const THREADS: u32 = 32;
+        const THREADS: u32 = 64;
         let queue: Arc<FixedQueue<u32, SIZE>> = Arc::default();
         let mut threads: Vec<_> = (0..THREADS)
             .map(|ii| {
@@ -435,10 +480,7 @@ mod tests {
                 std::thread::spawn(move || {
                     // Push one number, then pop one and return it.
                     queue.push(Box::new(ii)).unwrap();
-                    if true {
-                        // !cfg!(miri)
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                    }
+                    std::thread::yield_now();
                     *queue.pop().unwrap()
                 })
             })
@@ -446,5 +488,16 @@ mod tests {
 
         let sum: u32 = threads.drain(..).map(|t| t.join().unwrap()).sum();
         assert_eq!(sum, THREADS * (THREADS - 1) / 2);
+    }
+
+    // To run:  cargo test run_tests_forever -- --ignored
+    #[ignore = "loops forever"]
+    #[test]
+    fn run_tests_forever() {
+        loop {
+            fill_then_empty();
+            racing_readers();
+            push_pop();
+        }
     }
 }
