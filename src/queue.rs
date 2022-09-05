@@ -221,6 +221,31 @@ impl<const N: usize> AtomicSeqIndex<N> {
 #[derive(Debug)]
 pub struct QueueFull<T>(pub T);
 
+/// A lock-free concurrent queue with fixed size
+///
+/// # Examples
+/// ```no_run
+/// use std::sync::Arc;
+/// use fixed_channel::queue::FixedQueue;
+///
+/// const SIZE: usize = 1024;
+/// let queue: Arc<FixedQueue<u32, SIZE>> = Arc::default();
+///
+/// let mut threads: Vec<_> = (0..16)
+/// .map(|ii| {
+///     let queue = Arc::clone(&queue);
+///     std::thread::spawn(move || {
+///         // Push one number, then pop one and return it.
+///         queue.push(Box::new(ii)).expect("push failed");
+///         std::thread::sleep(std::time::Duration::from_millis(10));
+///         *queue.pop().expect("pop failed")
+///     })
+/// })
+/// .collect();
+///
+/// let sum: u32 = threads.drain(..).map(|t| t.join().unwrap()).sum();
+/// assert_eq!(sum, 120);
+/// ```
 pub struct FixedQueue<T, const N: usize> {
     pointer_array: Box<[AtomicSeqPointer<T>]>,
     phantom: PhantomData<T>,
@@ -250,6 +275,8 @@ impl<T, const N: usize> Drop for FixedQueue<T, N> {
 }
 
 impl<T, const N: usize> FixedQueue<T, N> {
+    /// Create a new empty `FixedQueue`.
+    ///
     // FIXME: make this const
     pub fn new() -> Self {
         let mut elements = Vec::new();
@@ -391,5 +418,33 @@ mod tests {
 
         let expected_sum = SIZE * (SIZE - 1) / 2;
         assert_eq!(sum, expected_sum as u64);
+    }
+
+    #[ignore = "broken"]
+    #[test]
+    fn push_pop() {
+        use std::sync::Arc;
+        use FixedQueue;
+
+        const SIZE: usize = 1024;
+        const THREADS: u32 = 32;
+        let queue: Arc<FixedQueue<u32, SIZE>> = Arc::default();
+        let mut threads: Vec<_> = (0..THREADS)
+            .map(|ii| {
+                let queue = Arc::clone(&queue);
+                std::thread::spawn(move || {
+                    // Push one number, then pop one and return it.
+                    queue.push(Box::new(ii)).unwrap();
+                    if true {
+                        // !cfg!(miri)
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    *queue.pop().unwrap()
+                })
+            })
+            .collect();
+
+        let sum: u32 = threads.drain(..).map(|t| t.join().unwrap()).sum();
+        assert_eq!(sum, THREADS * (THREADS - 1) / 2);
     }
 }
